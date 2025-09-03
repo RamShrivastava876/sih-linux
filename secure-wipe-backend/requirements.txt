@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+cryptography
+reportlab
+pydantic
+python-multipart
