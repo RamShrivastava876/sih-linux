@@ -88,26 +88,11 @@ def _persist_progress(device_id: str):
         with progress_lock, _db_lock:
             st = progress_stats.get(device_id)
             if not st: return
-            conn = _db_conn(); cur = conn.cursor()
-            cur.execute("INSERT OR REPLACE INTO progress(device_id, data) VALUES (?,?)", (device_id, _json_mod.dumps(st)))
-            conn.commit(); conn.close()
+        conn = _db_conn(); cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO progress(device_id, data) VALUES (?,?)", (device_id, json.dumps(st)))
+        conn.commit(); conn.close()
     except Exception:
         pass
-
-def _load_progress():
-    try:
-        with _db_lock:
-            conn = _db_conn(); cur = conn.cursor()
-            for row in cur.execute("SELECT data FROM progress"):
-                try:
-                    data = _json_mod.loads(row[0]); did = data.get('device_id');
-                    if did: progress_stats[did] = data
-                except Exception:
-                    continue
-            conn.close()
-    except Exception:
-        pass
-_load_progress()
 
 # Allow CORS for frontend
 app.add_middleware(
@@ -222,6 +207,10 @@ def rate_limit(request: Request):
         if not limit:
             return
         ip = request.client.host if request and request.client else "anon"
+        path = request.url.path if request else ''
+        # Relax progress polling slightly (2x window)
+        if path == '/progress_detailed':
+            limit = int(limit * 2)
         import time
         now = time.time()
         window_start = now - RATE_WINDOW_SEC
@@ -230,7 +219,10 @@ def rate_limit(request: Request):
         while hist and hist[0] < window_start:
             hist.pop(0)
         if len(hist) >= limit:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            # Provide Retry-After guidance (simple 5s or window reset)
+            retry_after = 5
+            headers = {"Retry-After": str(retry_after)}
+            raise HTTPException(status_code=429, detail="Rate limit exceeded", headers=headers)
         hist.append(now)
     except HTTPException:
         raise
@@ -245,6 +237,7 @@ progress_lock = threading.Lock()
 cancel_flags: Dict[str, bool] = {}
 _log_hash_states: Dict[str, Any] = {}
 import hashlib as _hashlib
+import time
 
 def _update_stream_hash(device_id: str, line: str):
     try:
@@ -268,6 +261,7 @@ def init_progress(device_id: str, method: str, total_bytes: int, passes_total: i
             "status": "running",
             "pass_patterns": pass_patterns or [],
             "verified": False,
+            "started_at": time.time(),
         }
     _persist_progress(device_id)
 
@@ -306,7 +300,82 @@ def finalize_progress(device_id: str, status: str, verified: bool = False):
         ps['status'] = status
         if verified:
             ps['verified'] = True
+        # stamp completion time
+        if status in ('completed','error','cancelled','raw_overwrite_done'):
+            ps['ended_at'] = time.time()
     _persist_progress(device_id)
+
+# Speed tracking cache (device_id -> (last_bytes, last_time, inst_speed))
+_speed_cache: Dict[str, Any] = {}
+
+def _compute_speed_eta(device_id: str):
+    try:
+        with progress_lock:
+            ps = progress_stats.get(device_id)
+            if not ps:
+                return None, None
+            total = ps.get('total_bytes') or 0
+            done = ps.get('bytes_done') or 0
+            now = time.time()
+            sc = _speed_cache.get(device_id)
+            if not sc:
+                _speed_cache[device_id] = (done, now, 0.0)
+                return 0.0, None
+            last_bytes, last_time, _ = sc
+            dt = max(1e-6, now - last_time)
+            delta = done - last_bytes
+            inst_speed = delta / dt  # bytes/sec
+            _speed_cache[device_id] = (done, now, inst_speed)
+            if inst_speed <= 0 or total <= 0 or done <= 0:
+                return 0.0, None
+            remaining = max(0, total - done)
+            eta = remaining / inst_speed
+            return inst_speed, eta
+    except Exception:
+        return None, None
+
+@app.get('/progress_detailed')
+def progress_detailed(device_id: str, _: bool = Depends(api_key_auth), request: Request = None):
+    rate_limit(request)
+    with progress_lock:
+        ps = progress_stats.get(device_id)
+        if not ps:
+            raise HTTPException(status_code=404, detail='No progress for device')
+        snapshot = dict(ps)  # shallow copy
+    speed, eta = _compute_speed_eta(device_id)
+    # Coverage ratio if we know device size via geometry
+    coverage_ratio = None
+    try:
+        geom = device_geometry.get(device_id) or {}
+        size_bytes = geom.get('size_bytes') or geom.get('capacity_bytes') or snapshot.get('total_bytes') or 0
+        if size_bytes and snapshot.get('bytes_done'):
+            coverage_ratio = min(1.0, snapshot['bytes_done']/float(size_bytes))
+    except Exception:
+        pass
+    warn = []
+    if coverage_ratio is not None and snapshot.get('status') in ('completed','raw_overwrite_done'):
+        if coverage_ratio < 0.99:
+            warn.append('coverage_below_99pct')
+    out = {
+        'device_id': device_id,
+        'method': snapshot.get('method'),
+        'status': snapshot.get('status'),
+        'bytes_done': snapshot.get('bytes_done'),
+        'total_bytes': snapshot.get('total_bytes'),
+        'passes_total': snapshot.get('passes_total'),
+        'pass_index': snapshot.get('pass_index'),
+        'current_pattern': snapshot.get('current_pattern'),
+        'pass_patterns': snapshot.get('pass_patterns'),
+        'verified': snapshot.get('verified'),
+        'percent': snapshot.get('percent'),
+        'coverage_ratio': coverage_ratio,
+        'write_speed_bytes_s': speed,
+        'eta_seconds': eta,
+        'warnings': warn or None,
+        'started_at': snapshot.get('started_at'),
+        'ended_at': snapshot.get('ended_at'),
+    }
+    return out
 
 # ----------------------------------------------------------------------------
 # /devices endpoint (clean implementation)
@@ -1096,6 +1165,11 @@ def erase_linux(device_id, method):
             _persist_log(device_id, msg)
             _update_stream_hash(device_id, msg)
         print(f"[ERASE][LINUX] {msg}")
+    # Prevent duplicate concurrent starts
+    with progress_lock:
+        if device_id in progress_stats and progress_stats[device_id].get('status') == 'running':
+            log(f"Duplicate start suppressed: erase already running for {device_id}")
+            return
     log(f"Starting Linux erase: {device_id} with method {method}")
     # Collect device facts (best effort)
     dev_facts = {}
@@ -1158,7 +1232,7 @@ def erase_linux(device_id, method):
                                 log('HPA cleared: max sectors now equals native.')
                             else:
                                 hpa_res['hpa_cleared'] = False
-                                log('HPA clear attempt did not succeed (max != native).')
+                                log(f'HPA clear attempt did not succeed (max {m2.group(1) if m2 else cur} != native {m2.group(2) if m2 else native}).')
                         else:
                             hpa_res['hpa_cleared'] = True  # nothing to clear
                     # DCO identify and restore
@@ -1184,8 +1258,12 @@ def erase_linux(device_id, method):
     except Exception:
         pass
 
-    # Prepare size & passes
+    # Prepare size & passes and sanity check device size
     try:
+        dev_size = get_block_device_size(device_id)
+        if dev_size is not None and dev_size > 0 and dev_size < 1024*1024:  # <1MiB
+            log(f'Device size extremely small ({dev_size} bytes) after HPA/DCO attempts; aborting erase (likely clipped or failing media).')
+            return
         # Map higher level methods onto primitives
         effective = method
         if method in ("dod_5220_22m", "multi-pass"):
@@ -1256,10 +1334,28 @@ def erase_linux(device_id, method):
             else:
                 log("Secure erase gated (set CERTIWIPE_ENABLE_SECURE_ERASE=1 to enable). Fallback to overwrite.")
             # Fallback ensure at least single pass overwrite for 'auto'
-            perform_linux_overwrite(device_id, 'multi-pass', log)
+            try:
+                perform_linux_overwrite(device_id, 'multi-pass', log)
+            except OSError as oe:
+                if getattr(oe, 'errno', None) == 28:
+                    log('Raw overwrite failed: ENOSPC (device reports no space) – marking hardware_fault.')
+                    finalize_progress(device_id, 'hardware_fault')
+                    return
+                raise
         elif effective == "multi-pass":
             log("Running shred for multi-pass overwrite...")
-            subprocess.run(["shred", "-vzn", "3", device_id], check=True)
+            try:
+                subprocess.run(["shred", "-vzn", "3", device_id], check=True)
+            except subprocess.CalledProcessError as cpe:
+                log(f'shred failed (rc={cpe.returncode}); attempting raw fallback.')
+                try:
+                    perform_linux_overwrite(device_id, 'multi-pass', log)
+                except OSError as oe:
+                    if getattr(oe, 'errno', None) == 28:
+                        log('Raw fallback overwrite failed: ENOSPC – marking hardware_fault.')
+                        finalize_progress(device_id, 'hardware_fault')
+                        return
+                    raise
             log("shred completed.")
         elif effective == "crypto-erase":
             log("Running blkdiscard for SSD trim/discard...")
@@ -1302,8 +1398,12 @@ def erase_linux(device_id, method):
                 pass_digests.setdefault(device_id, []).append({"post_samples": digests})
         except Exception as e:
             log(f"Post verification sampling failed: {e}")
-        log("Linux erase process finished.")
-        generate_certificate(device_id, method, log)
+        status = progress_stats.get(device_id, {}).get('status')
+        if status and status not in ('error','hardware_fault','cancelled'):
+            log("Linux erase process finished.")
+            generate_certificate(device_id, method, log)
+        else:
+            log(f'Skipping certificate generation (final status={status}).')
     except Exception as e:
         log(f"Linux erase failed: {e}")
     time.sleep(1)
@@ -1806,6 +1906,21 @@ def platform_capabilities(device_id: str | None = None, _: bool = Depends(api_ke
         pass
     return caps
 
+@app.get('/settings')
+def settings_info(_: bool = Depends(api_key_auth), request: Request = None):
+    rate_limit(request)
+    flags = {
+        'secure_erase_enabled': os.environ.get('CERTIWIPE_ENABLE_SECURE_ERASE') == '1',
+        'hpa_dco_enabled': os.environ.get('CERTIWIPE_ENABLE_HPA_DCO') == '1',
+        'mock_enabled': os.environ.get('CERTIWIPE_ENABLE_MOCK') == '1',
+        'post_format_fs': os.environ.get('CERTIWIPE_POST_FORMAT_FS') or None,
+        'auto_prepare': os.environ.get('CERTIWIPE_AUTO_PREPARE') == '1',
+        'windows_sample_mode': os.environ.get('CERTIWIPE_WINDOWS_SAMPLE_ONLY') == '1',
+        'audit_enabled': settings.audit_enabled,
+        'rate_limit_per_minute': settings.rate_limit_per_minute,
+    }
+    return {'flags': flags, 'schema_version': '1'}
+
 @app.post('/transparency_publish')
 def transparency_publish(device_id: str, _: bool = Depends(api_key_auth), request: Request = None):
     rate_limit(request)
@@ -1826,6 +1941,12 @@ def generate_certificate(device_id, method, log):
     import datetime
     import hashlib
     import math
+    # Abort if progress indicates failure/cancelled
+    ps = progress_stats.get(device_id)
+    bad_statuses = {'error','cancelled','hardware_fault','permission_denied'}
+    if ps and ps.get('status') in bad_statuses:
+        log(f'Certificate suppressed (status={ps.get("status")}).')
+        return
     # Get erasure log for device
     log_lines = erase_logs.get(device_id, [])
     # Prefer streaming hash state if present
@@ -1927,6 +2048,33 @@ def generate_certificate(device_id, method, log):
     elif eco_disabled:
         eco_obj = {"disabled": True}
     # Build certificate core
+    # Progress / coverage metrics
+    coverage_ratio = None
+    bytes_done = None
+    total_bytes = None
+    started_at = None
+    ended_at = None
+    duration = None
+    avg_speed_bps = None
+    try:
+        if ps:
+            bytes_done = ps.get('bytes_done')
+            total_bytes = ps.get('total_bytes')
+            started_at = ps.get('started_at')
+            ended_at = ps.get('ended_at') or time.time()
+            if started_at and ended_at and ended_at > started_at:
+                duration = ended_at - started_at
+            geom = device_geometry.get(device_id) or {}
+            dev_size = geom.get('size_bytes') or geom.get('capacity_bytes') or total_bytes
+            if dev_size and bytes_done is not None:
+                coverage_ratio = min(1.0, bytes_done/float(dev_size))
+            if bytes_done is not None and duration:
+                avg_speed_bps = bytes_done / duration
+    except Exception:
+        pass
+    warnings_list = []
+    if coverage_ratio is not None and coverage_ratio < 0.99:
+        warnings_list.append('coverage_below_99pct')
     cert_data = {
         "device_id": device_id,
         "method": method,
@@ -1934,11 +2082,21 @@ def generate_certificate(device_id, method, log):
         "status": "success",
         "log_hash": log_hash,
         "passes": passes,
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "log_chain_head": log_chain_heads.get(device_id),
-    "trust_score": trust_score,
-    "trust_components": trust_components,
-    "eco": eco_obj,
+        "trust_score": trust_score,
+        "trust_components": trust_components,
+        "eco": eco_obj,
+        "progress": {
+            "bytes_done": bytes_done,
+            "total_bytes": total_bytes,
+            "coverage_ratio": coverage_ratio,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": duration,
+            "avg_write_speed_bytes_s": avg_speed_bps,
+        },
+        "warnings": warnings_list or None,
     }
     if device_id in device_geometry:
         cert_data["geometry"] = device_geometry.get(device_id)
@@ -2276,25 +2434,58 @@ def windows_raw_multi_pass(device_id: str, method: str, log):
             log("windows_raw_multi_pass: Volume locked and dismounted.")
         except Exception:
             log("windows_raw_multi_pass: Could not lock/dismount volume (may be in use). Proceeding.")
-        # Decide scope: default to FULL (if not system device) unless sample-only is explicitly set
-        sample_only = os.environ.get(WINDOWS_SAMPLE_ONLY_ENV) == '1'
-        legacy_full_env = os.environ.get(WINDOWS_FULL_RAW_ENV) == '1'
-        legacy_full_flag = os.path.exists(WINDOWS_FULL_RAW_FLAG_FILE)
-        # Full if not sample-only and size known and device is not system
-        do_full = False
-        if not sample_only and size_bytes > 0 and not is_system_device(device_id):
-            do_full = True
-        # Legacy force-full still supported (requires both env+flag)
-        if legacy_full_env and legacy_full_flag:
-            do_full = True
+        # Decide scope: enforce FULL overwrite unless explicitly forced into sample mode
+        sample_env = os.environ.get('CERTIWIPE_WINDOWS_SAMPLE_ONLY') == '1'
+        # Optional explicit opt-in flag file for sample (defense-in-depth)
+        sample_flag = os.path.exists('ALLOW_WINDOWS_SAMPLE_MODE')
+        is_system = is_system_device(device_id)
+        do_full = True
+        if is_system:
+            log('windows_raw_multi_pass: system device detected -> refusing destructive raw overwrite.')
+            os.close(fd)
+            return
+        if size_bytes <= 0:
+            # WMI/PowerShell fallback
+            try:
+                import subprocess, json as _json
+                # Query Win32_DiskDrive for Size where DeviceID contains the physical drive number
+                import re
+                m = re.search(r'(\d+)$', device_id)
+                drv_num = m.group(1) if m else None
+                if drv_num:
+                    ps = (
+                        f"Get-WmiObject Win32_DiskDrive | Where-Object {{$_.Index -eq {drv_num}}} | "
+                        "Select-Object -First 1 Size | ConvertTo-Json"
+                    )
+                    proc = subprocess.run(["powershell","-NoProfile","-Command", ps], capture_output=True, text=True, timeout=8)
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        try:
+                            parsed = _json.loads(proc.stdout)
+                            if isinstance(parsed, dict):
+                                wb = int(parsed.get('Size') or 0)
+                            else:  # sometimes just number
+                                wb = int(parsed)
+                            if wb > 0:
+                                size_bytes = wb
+                                geometry['size_bytes'] = wb
+                                log(f'windows_raw_multi_pass: WMI fallback size detected: {wb} bytes')
+                        except Exception:
+                            pass
+            except Exception as fe:
+                log(f'windows_raw_multi_pass: WMI size fallback failed: {fe}')
+        if size_bytes <= 0:
+            log('windows_raw_multi_pass: still no reliable disk size after WMI fallback; aborting to avoid false certification.')
+            os.close(fd)
+            return
+        if sample_env and sample_flag:
+            do_full = False
+            log('windows_raw_multi_pass: SAMPLE MODE explicitly enabled (CERTIWIPE_WINDOWS_SAMPLE_ONLY=1 + ALLOW_WINDOWS_SAMPLE_MODE flag). This run will NOT produce a certified full wipe.')
         if do_full:
-            SAMPLE_BYTES = size_bytes if size_bytes>0 else (8*1024*1024)
-            log_msg = "FULL raw overwrite ENABLED by default" if (not legacy_full_env) else f"FULL raw overwrite ENABLED (legacy gate {WINDOWS_FULL_RAW_ENV}=1 + {WINDOWS_FULL_RAW_FLAG_FILE})"
-            log(f"windows_raw_multi_pass: {log_msg}, size={SAMPLE_BYTES} bytes")
+            SAMPLE_BYTES = size_bytes
+            log(f'windows_raw_multi_pass: FULL raw overwrite confirmed, size={SAMPLE_BYTES} bytes')
         else:
-            SAMPLE_BYTES = min(8 * 1024 * 1024, size_bytes or (8 * 1024 * 1024)) or (8*1024*1024)
-            reason = 'sample-only env set' if sample_only else 'unknown size or system device'
-            log(f"windows_raw_multi_pass: SAFE SAMPLE MODE {SAMPLE_BYTES//(1024*1024)} MiB ({reason}); set {WINDOWS_SAMPLE_ONLY_ENV}=0 (or unset) for full on non-system devices")
+            SAMPLE_BYTES = min(8*1024*1024, size_bytes)
+            log(f'windows_raw_multi_pass: operating in LIMITED SAMPLE MODE {SAMPLE_BYTES//(1024*1024)} MiB (non-cert).')
         # Define patterns based on method
         if method == 'dod_5220_22m':
             patterns = [b"\xFF", b"\x00", None]
@@ -2379,8 +2570,10 @@ def windows_raw_multi_pass(device_id: str, method: str, log):
         # Store geometry for certificate
         if device_id not in device_geometry:
             device_geometry[device_id] = geometry
-        finalize_progress(device_id, 'raw_overwrite_done')
-        log(f"Windows raw multi-pass sample overwrite complete (sample={SAMPLE_BYTES//(1024*1024)} MiB).")
+        finalize_progress(device_id, 'raw_overwrite_done', verified=do_full and verify_ok)
+        cov_ratio = 1.0 if do_full else SAMPLE_BYTES/float(size_bytes or SAMPLE_BYTES)
+        log_suffix = 'FULL' if do_full else 'SAMPLE'
+        log(f"Windows raw multi-pass {log_suffix} overwrite complete; bytes_written={SAMPLE_BYTES} size={size_bytes} coverage_ratio={cov_ratio:.4f} verified={verify_ok if do_full else False}.")
     except Exception as e:
         log(f"windows_raw_multi_pass unexpected error: {e}")
 
