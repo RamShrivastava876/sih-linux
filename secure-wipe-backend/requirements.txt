@@ -4,3 +4,7 @@ cryptography
 reportlab
 pydantic
 python-multipart
+qrcode[pil]
+pydantic-settings
+opentimestamps-client
+pytest
