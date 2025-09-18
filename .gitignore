@@ -18,6 +18,10 @@ certiwipe.db
 progress_*.json
 secure-wipe-backend/diskpart_script.txt
 secure-wipe-backend/tools/*.ps1
+secure-wipe-backend/mock_device.bin
+secure-wipe-backend/progress_* 
+secure-wipe-backend/keys/*
+!secure-wipe-backend/keys/.gitkeep
 
 # Logs
 *.log
@@ -40,6 +44,7 @@ coverage/
 secure-wipe-frontend/node_modules/
 secure-wipe-frontend/build/
 secure-wipe-frontend/.cache/
+secure-wipe-frontend/*.tgz
 
 # OS / Editor
 .DS_Store
@@ -49,3 +54,6 @@ Thumbs.db
 
 # Misc
 *.swp
+*.bak
+*.tmp
+~$*
