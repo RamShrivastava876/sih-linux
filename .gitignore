@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# SQLite / runtime artifacts
+certiwipe.db
+*.jsonl
+progress_*.json
+secure-wipe-backend/diskpart_script.txt
+secure-wipe-backend/tools/*.ps1
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+*.cache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+
+# Build outputs
+build/
+dist/
+coverage/
+
+# Frontend runtime artifacts
+secure-wipe-frontend/node_modules/
+secure-wipe-frontend/build/
+secure-wipe-frontend/.cache/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Misc
+*.swp
