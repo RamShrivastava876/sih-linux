@@ -1171,6 +1171,9 @@ def erase_linux(device_id, method):
             log(f"Duplicate start suppressed: erase already running for {device_id}")
             return
     log(f"Starting Linux erase: {device_id} with method {method}")
+    # Track whether we've already performed a write pass and/or completed a secure-erase
+    did_write = False
+    secure_done = False
     # Collect device facts (best effort)
     dev_facts = {}
     try:
@@ -1271,7 +1274,11 @@ def erase_linux(device_id, method):
         if method == "shunyawipe":
             # Simulate: overwrite pass + blkdiscard
             log("ShunyaWipe phase 1: random overwrite (shred 1 pass)...")
-            subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+            try:
+                subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+                did_write = True
+            except subprocess.CalledProcessError as cpe:
+                log(f"shred failed (rc={cpe.returncode}); will rely on raw overwrite phase.")
             log("ShunyaWipe phase 2: blkdiscard crypto/trim ...")
             try:
                 subprocess.run(["blkdiscard", device_id], check=True)
@@ -1280,14 +1287,23 @@ def erase_linux(device_id, method):
             effective = "crypto-erase"
         if method == "nist_800_88":
             log("NIST 800-88: one overwrite pass + verify sample sectors")
-            subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+            try:
+                subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+                did_write = True
+            except subprocess.CalledProcessError as cpe:
+                log(f"shred failed (rc={cpe.returncode}); will rely on raw overwrite phase.")
             log("NIST 800-88: verification sampling (deterministic offsets)")
             effective = "verify"
         if method == "ecowipe":
             log("EcoWipe: single lightweight overwrite pass...")
-            subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+            try:
+                subprocess.run(["shred", "-vz", "-n", "1", device_id], check=True)
+                did_write = True
+            except subprocess.CalledProcessError as cpe:
+                log(f"shred failed (rc={cpe.returncode}); will rely on raw overwrite phase.")
             effective = "single-pass"
-        if method in ("multi-pass", "dod_5220_22m", "nist_800_88", "ecowipe", "shunyawipe"):
+        # Only run raw overwrite if we haven't already completed a pass via shred
+        if method in ("multi-pass", "dod_5220_22m", "nist_800_88", "ecowipe", "shunyawipe") and not did_write:
             perform_linux_overwrite(device_id, method, log)
         if effective == "auto":
             # Secure erase gating via env CERTIWIPE_ENABLE_SECURE_ERASE=1
@@ -1312,6 +1328,7 @@ def erase_linux(device_id, method):
                         except Exception:
                             pass
                         log("NVMe sanitize command issued.")
+                        secure_done = True
                     except Exception as e:
                         log(f"NVMe sanitize failed: {e}")
                 elif shutil.which('hdparm'):
@@ -1327,21 +1344,24 @@ def erase_linux(device_id, method):
                             if hi.returncode == 0 and 'not frozen' in hi.stdout.lower():
                                 log("hdparm identify indicates drive not frozen; secure erase likely done.")
                                 break
+                        secure_done = True
                     except Exception as e:
                         log(f"ATA secure erase failed: {e}")
                 else:
                     log("No secure erase tool available; falling back to overwrite.")
             else:
                 log("Secure erase gated (set CERTIWIPE_ENABLE_SECURE_ERASE=1 to enable). Fallback to overwrite.")
-            # Fallback ensure at least single pass overwrite for 'auto'
-            try:
-                perform_linux_overwrite(device_id, 'multi-pass', log)
-            except OSError as oe:
-                if getattr(oe, 'errno', None) == 28:
-                    log('Raw overwrite failed: ENOSPC (device reports no space) – marking hardware_fault.')
-                    finalize_progress(device_id, 'hardware_fault')
-                    return
-                raise
+            # If secure erase succeeded, skip destructive raw overwrite fallback
+            if not secure_done:
+                # Fallback ensure at least single pass overwrite for 'auto'
+                try:
+                    perform_linux_overwrite(device_id, 'multi-pass', log)
+                except OSError as oe:
+                    if getattr(oe, 'errno', None) == 28:
+                        log('Raw overwrite failed: ENOSPC (device reports no space) – marking hardware_fault.')
+                        finalize_progress(device_id, 'hardware_fault')
+                        return
+                    raise
         elif effective == "multi-pass":
             log("Running shred for multi-pass overwrite...")
             try:
@@ -1359,8 +1379,19 @@ def erase_linux(device_id, method):
             log("shred completed.")
         elif effective == "crypto-erase":
             log("Running blkdiscard for SSD trim/discard...")
-            subprocess.run(["blkdiscard", device_id], check=True)
-            log("blkdiscard completed.")
+            try:
+                subprocess.run(["blkdiscard", device_id], check=True)
+                log("blkdiscard completed.")
+            except subprocess.CalledProcessError as cpe:
+                log(f"blkdiscard failed (rc={cpe.returncode}); falling back to single-pass raw overwrite.")
+                try:
+                    perform_linux_overwrite(device_id, 'ecowipe', log)
+                except OSError as oe:
+                    if getattr(oe, 'errno', None) == 28:
+                        log('Raw overwrite failed: ENOSPC (device reports no space) – marking hardware_fault.')
+                        finalize_progress(device_id, 'hardware_fault')
+                        return
+                    raise
         else:
             log(f"Method mapped to no-op / already handled: {method} -> {effective}")
     # LUKS detection and header zeroization (best-effort if cryptsetup present)
@@ -2349,6 +2380,17 @@ def perform_linux_overwrite(device_id: str, method: str, log, resume: bool=False
     except PermissionError:
         finalize_progress(device_id, "permission_denied")
         log("Permission denied for raw device overwrite; run as root for direct patterns.")
+    except OSError as oe:
+        try:
+            import errno as _errno
+        except Exception:
+            _errno = None
+        if _errno is not None and getattr(oe, 'errno', None) == _errno.ENOSPC:
+            finalize_progress(device_id, "hardware_fault")
+            log("Raw overwrite failed: ENOSPC (device reports no space) – marking hardware_fault.")
+            return
+        finalize_progress(device_id, "error")
+        log(f"Raw overwrite failed: {oe}")
     except Exception as e:
         finalize_progress(device_id, "error")
         log(f"Raw overwrite failed: {e}")
