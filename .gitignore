@@ -32,4 +32,5 @@ secure-wipe-frontend/coverage/
 ehthumbs.db
 Desktop.ini
 
-# Note: certiwipe.db is currently tracked; do NOT ignore it here to avoid index mismatch.
+# Ignore runtime SQLite DB (stop tracking going forward)
+secure-wipe-backend/certiwipe.db
